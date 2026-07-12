@@ -123,6 +123,7 @@ namespace TerrariaSaveConverter
         static byte[] ConvertSavePayload(byte[] fileBytes, string fileName, Platform targetPlatform)
         {
             string fileNameLower = fileName.ToLower();
+            // 修正：只有 .plr 玩家文件被 AES 加密。地图和世界是明文的！
             bool isEncrypted = fileNameLower.EndsWith(".plr") || fileNameLower.EndsWith(".plr.bak");
 
             byte[] processData = isEncrypted ? DecryptAES(fileBytes) : fileBytes;
@@ -132,11 +133,19 @@ namespace TerrariaSaveConverter
             using BinaryReader br = new BinaryReader(ms);
 
             int versionRaw = br.ReadInt32();
+            bool isCompressed = (versionRaw & 0x8000) == 0x8000;
             int trueVersion = versionRaw & ~0x8000;
             bool hasMetadata = trueVersion >= 135;
 
+            // ===== 1. 地图文件处理 (.map) =====
             if (fileNameLower.EndsWith(".map") || fileNameLower.EndsWith(".map.bak"))
             {
+                if (!isCompressed)
+                {
+                    Console.WriteLine(" (跳过: 远古未压缩地图格式，无需字典修正，交由游戏自动升级)");
+                    return fileBytes;
+                }
+
                 Platform currentPlatform = Platform.Unknown;
 
                 if (hasMetadata)
