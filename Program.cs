@@ -90,18 +90,15 @@ namespace TerrariaSaveConverter
             if (rawArgs.Count < 2)
             {
                 Console.WriteLine("==================================================");
-                Console.WriteLine("  泰拉瑞亚 存档全自动双向 ZIP 转换工具");
+                Console.WriteLine("  泰拉瑞亚 存档全自动双向转换工具");
                 Console.WriteLine("==================================================");
                 Console.WriteLine("用法: TerrariaSaveConverter <输入路径或ZIP包> <目标平台(cn/intl)> [-v|--verbose]");
                 return;
             }
 
-            if (Logger.EnableVerbose)
-            {
-                Logger.Info("==================================================");
-                Logger.Info("  泰拉瑞亚 存档全自动双向 ZIP 转换工具");
-                Logger.Info("==================================================");
-            }
+            Logger.Info("==================================================");
+            Logger.Info("  泰拉瑞亚 存档全自动双向转换工具");
+            Logger.Info("==================================================");
 
             TryLoadIntlConstants(out INTL_TILE_COUNT, out INTL_WALL_COUNT);
 
@@ -136,7 +133,8 @@ namespace TerrariaSaveConverter
 
         static void ProcessZipArchive(string inputZipPath, string outputZipPath, Platform targetPlatform)
         {
-            Logger.Info($"\n📦 正在加载 ZIP 归档包: {Path.GetFileName(inputZipPath)}");
+            Logger.Info($"\n📦 正在处理 ZIP 归档包: {Path.GetFileName(inputZipPath)}");
+
             if (File.Exists(outputZipPath)) File.Delete(outputZipPath);
 
             Encoding safeEncoding = DetectZipEncoding(inputZipPath);
@@ -167,7 +165,9 @@ namespace TerrariaSaveConverter
                     fileBytes = ms.ToArray();
                 }
 
-                Logger.Info($"  -> [正在处理] {entry.FullName} ", false);
+                if (Logger.EnableVerbose) Logger.Info($"\n  -> [解析文件] {entry.FullName}");
+                else Logger.Info($"  -> [处理] {entry.FullName} ... ", false);
+
                 byte[] processedBytes = ConvertSavePayload(fileBytes, entry.Name, targetPlatform);
 
                 ZipArchiveEntry targetEntry = targetZip.CreateEntry(entry.FullName);
@@ -179,7 +179,9 @@ namespace TerrariaSaveConverter
         static void ProcessSingleFile(string inputPath, string outputPath, Platform targetPlatform)
         {
             byte[] rawBytes = File.ReadAllBytes(inputPath);
-            Logger.Info($"正在处理文件 {Path.GetFileName(inputPath)}... ", false);
+            if (Logger.EnableVerbose) Logger.Info($"\n📄 正在解析单文件: {Path.GetFileName(inputPath)}");
+            else Logger.Info($"📄 正在处理 {Path.GetFileName(inputPath)} ... ", false);
+            
             byte[] processedBytes = ConvertSavePayload(rawBytes, Path.GetFileName(inputPath), targetPlatform);
             File.WriteAllBytes(outputPath, processedBytes);
         }
@@ -189,10 +191,15 @@ namespace TerrariaSaveConverter
             string fileNameLower = fileName.ToLower();
             bool isEncrypted = fileNameLower.EndsWith(".plr") || fileNameLower.EndsWith(".plr.bak");
             
-            if (isEncrypted) Logger.Verbose($"\n    [AES 解密] 目标文件受加密保护，正在解密...");
+            if (isEncrypted) Logger.Verbose($"    [AES 解密] 目标文件受加密保护，正在解密...");
             byte[] processData = isEncrypted ? DecryptAES(fileBytes) : fileBytes;
             
-            if (processData.Length < 12) return fileBytes;
+            if (processData.Length < 12)
+            {
+                if (Logger.EnableVerbose) Logger.Warn("    └─ [跳过] 文件过小或损坏");
+                else Logger.Warn("跳过 (文件损坏)");
+                return fileBytes;
+            }
 
             using MemoryStream ms = new MemoryStream(processData);
             using BinaryReader br = new BinaryReader(ms);
@@ -206,20 +213,40 @@ namespace TerrariaSaveConverter
 
             if (fileNameLower.EndsWith(".map") || fileNameLower.EndsWith(".map.bak"))
             {
-                if (!isCompressed)
-                {
-                    Logger.Info("(已跳过: 远古未压缩地图)");
-                    Logger.Verbose("    [拦截] 地图非 Zlib 压缩格式 (<= Version 91)，安全放行。");
-                    return fileBytes;
-                }
-
                 Platform currentPlatform = Platform.Unknown;
+                byte fileType = 3;
                 if (hasMetadata)
                 {
                     ulong magic = br.ReadUInt64();
+                    fileType = (byte)((magic >> 56) & 0xFF);
                     ulong baseMagic = magic & 0x00FFFFFFFFFFFFFF;
                     if (baseMagic == INTL_MAGIC) currentPlatform = Platform.International;
                     else if (baseMagic == CN_MAGIC) currentPlatform = Platform.China;
+                }
+
+                // 核心修复：即使不是分块压缩格式（如 PC 版原生 V2 地图），只要有 Metadata，也必须修改 Magic Number！
+                if (!isCompressed)
+                {
+                    if (hasMetadata && currentPlatform != Platform.Unknown && currentPlatform != targetPlatform)
+                    {
+                        ulong newMagic = (targetPlatform == Platform.China ? CN_MAGIC : INTL_MAGIC) | ((ulong)fileType << 56);
+                        Logger.Verbose($"    [特征码] {(currentPlatform == Platform.China ? "CN" : "INTL")} -> {(targetPlatform == Platform.China ? "CN" : "INTL")} (非分块流地图)");
+                        
+                        ms.Seek(4, SeekOrigin.Begin);
+                        using (BinaryWriter bw = new BinaryWriter(ms, Encoding.UTF8, true))
+                        {
+                            bw.Write(newMagic);
+                        }
+                        
+                        if (Logger.EnableVerbose) Logger.Success("    └─ [完成] 无损转换 (PC原生连续流，仅切换特征码)");
+                        else Logger.Success("成功 (无损切换特征码)");
+                        
+                        return ms.ToArray();
+                    }
+                    Logger.Verbose("    [拦截] 地图非 Zlib 分块压缩格式，且平台匹配或未知，已安全放行。");
+                    if (Logger.EnableVerbose) Logger.Success("    └─ [跳过] 格式不符或无需转换");
+                    else Logger.Success("跳过 (无需转换)");
+                    return processData;
                 }
 
                 ms.Seek(0, SeekOrigin.Begin);
@@ -229,7 +256,9 @@ namespace TerrariaSaveConverter
             {
                 if (!hasMetadata)
                 {
-                    Logger.Info("(已跳过: 无元数据)");
+                    Logger.Verbose("    [拦截] 文件无元数据，无法进行解析。");
+                    if (Logger.EnableVerbose) Logger.Success("    └─ [跳过] 无元数据");
+                    else Logger.Success("跳过 (无元数据)");
                     return fileBytes;
                 }
 
@@ -243,12 +272,14 @@ namespace TerrariaSaveConverter
 
                 if (currentPlatform == targetPlatform || currentPlatform == Platform.Unknown)
                 {
-                    Logger.Info("(已跳过: 平台匹配或未知格式)");
+                    Logger.Verbose("    [拦截] 平台已匹配或格式未知，已安全放行。");
+                    if (Logger.EnableVerbose) Logger.Success("    └─ [跳过] 平台一致或未知");
+                    else Logger.Success("跳过 (无需转换)");
                     return fileBytes;
                 }
 
                 ulong newMagic = (targetPlatform == Platform.China ? CN_MAGIC : INTL_MAGIC) | ((ulong)fileType << 56);
-                Logger.Verbose($"    [Magic Number] {baseMagic:X16} -> {(newMagic & 0x00FFFFFFFFFFFFFF):X16}");
+                Logger.Verbose($"    [特征码] {baseMagic:X16} -> {(newMagic & 0x00FFFFFFFFFFFFFF):X16}");
                 
                 ms.Seek(4, SeekOrigin.Begin);
                 using (BinaryWriter bw = new BinaryWriter(ms, Encoding.UTF8, true))
@@ -257,7 +288,8 @@ namespace TerrariaSaveConverter
                 }
 
                 processData = ms.ToArray();
-                Logger.Success("(Magic Number 切换完成)");
+                if (Logger.EnableVerbose) Logger.Success("    └─ [完成] 成功切换文件特征码");
+                else Logger.Success("成功 (切换特征码)");
             }
 
             if (isEncrypted)
@@ -323,8 +355,10 @@ namespace TerrariaSaveConverter
                     using BinaryWriter quickBw = new BinaryWriter(quickMs, Encoding.UTF8, true);
                     ulong newMagic = (to == Platform.China ? CN_MAGIC : INTL_MAGIC) | ((ulong)fileType << 56);
                     quickBw.Write(newMagic);
+                    quickBw.Flush();
                 }
-                Logger.Success("(无损转换: 字典已完美对齐，仅切换头部标识)");
+                if (Logger.EnableVerbose) Logger.Success("    └─ [完成] 无损转换 (字典已对齐，仅切换特征码)");
+                else Logger.Success("成功 (无损切换特征码)");
                 return quickMs.ToArray();
             }
 
@@ -350,11 +384,10 @@ namespace TerrariaSaveConverter
             for (int i = 0; i < num7; i++) dict.Add(srcId++, dstId++);
             for (int i = 0; i < num8; i++) dict.Add(srcId++, dstId++);
             for (int i = 0; i < num9; i++) dict.Add(srcId++, dstId++);
-            dict.Add(srcId++, dstId++); // 填补最后默认背景层缺失的坑
+            dict.Add(srcId++, dstId++); // 处理末尾默认背景层映射
 
             Logger.Verbose($"    [Dict Build] 成功重构字典, File Options: {srcId - 1}, Target Options: {dstId - 1}");
 
-            // ===== 逆向映射审计器 (仅在 Verbose 下初始化) =====
             Dictionary<ushort, string>? auditMap = null;
             if (Logger.EnableVerbose)
             {
@@ -435,7 +468,6 @@ namespace TerrariaSaveConverter
                                 erasedTypes[type]++;
                                 erasedCount++;
 
-                                // 处理 ushort 下溢出风险：强制抹零 4-byte 避免变 .bad
                                 chunkBuf[typeOffset] = 0;
                                 chunkBuf[typeOffset + 1] = 0;
                                 chunkBuf[typeOffset + 2] = 0;
@@ -460,7 +492,8 @@ namespace TerrariaSaveConverter
                 }
             }
 
-            Logger.Success($"(有损转换: 国服 -> 国际服, 字典对齐且越界数据已安全归零, 共擦除像素: {erasedCount})");
+            if (Logger.EnableVerbose) Logger.Success($"    └─ [完成] 有损转换 (字典对齐, 擦除越界像素: {erasedCount})");
+            else Logger.Success($"成功 (擦除像素: {erasedCount})");
             
             if (erasedCount > 0 && Logger.EnableVerbose)
             {
@@ -468,11 +501,11 @@ namespace TerrariaSaveConverter
                 foreach (var kvp in erasedTypes.OrderByDescending(k => k.Value))
                 {
                     string desc = auditMap != null && auditMap.ContainsKey(kvp.Key) ? auditMap[kvp.Key] : "未知数据结构";
-                    Logger.Verbose($"      - [Option {kvp.Key}] {desc} => 物理擦除 {kvp.Value} 个像素");
+                    Logger.Verbose($"      - [Option {kvp.Key}] {desc} => 安全擦除 {kvp.Value} 个像素");
                 }
             }
 
-            bw.Flush(); // 解决截断写入引发的 EOF 越界异常
+            bw.Flush();
             return outMs.ToArray();
         }
 
@@ -521,7 +554,7 @@ namespace TerrariaSaveConverter
 
             try
             {
-                Logger.Success($"✅ 成功定位引擎: {exePath}");
+                Logger.Verbose($"    ✅ 成功定位引擎: {exePath}");
                 using ModuleDefinition module = ModuleDefinition.ReadModule(exePath);
                 
                 var tileIdType = module.Types.FirstOrDefault(t => t.FullName == "Terraria.ID.TileID");
@@ -531,7 +564,7 @@ namespace TerrariaSaveConverter
                 {
                     intlTileCount = GetFieldConstantFromIL(tileIdType, "Count");
                     intlWallCount = GetFieldConstantFromIL(wallIdType, "Count");
-                    Logger.Success($"🎯 IL 穿透提取成功! [TileCount: {intlTileCount} | WallCount: {intlWallCount}]");
+                    Logger.Verbose($"    🎯 IL 穿透提取成功! [TileCount: {intlTileCount} | WallCount: {intlWallCount}]");
                 }
                 else
                 {
@@ -568,7 +601,7 @@ namespace TerrariaSaveConverter
                             prevInst = prevIndex >= 0 ? instructions[prevIndex] : null;
                         }
 
-                        if (prevInst == null) continue; // CS8602 边界安全防护
+                        if (prevInst == null) continue;
 
                         if (prevInst.OpCode == OpCodes.Ldc_I4 && prevInst.Operand != null) return (int)prevInst.Operand;
                         if (prevInst.OpCode == OpCodes.Ldc_I4_S && prevInst.Operand != null) return (sbyte)prevInst.Operand;
